@@ -1,28 +1,18 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
-  StyleSheet, 
-  Text, 
-  View, 
-  TouchableOpacity, 
-  TextInput, 
-  SafeAreaView, 
-  Alert,
-  Keyboard,
-  TouchableWithoutFeedback,
-  KeyboardAvoidingView,
-  Platform,
-  useWindowDimensions
+  StyleSheet, Text, View, TouchableOpacity, TextInput, 
+  SafeAreaView, Alert, Keyboard, TouchableWithoutFeedback, 
+  KeyboardAvoidingView, Platform, useWindowDimensions, ActivityIndicator
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import * as MediaLibrary from 'expo-media-library'; 
 import * as ScreenOrientation from 'expo-screen-orientation'; 
 
 // --- Firebase Imports ---
 import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, setDoc, onSnapshot, updateDoc } from 'firebase/firestore';
+import { getStorage, ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 
-// ⚠️ WICHTIG: Füge hier deine echten Firebase-Konfigurationsdaten ein! ⚠️
-// Solange hier Platzhalter stehen, funktioniert die automatische Cloud-Verbindung nicht.
+// ⚠️ WICHTIG: Deine eigenen Firebase-Daten (Storage muss in Firebase aktiviert sein!)
 const firebaseConfig = {
   apiKey: "DEIN_API_KEY",
   authDomain: "dein-projekt.firebaseapp.com",
@@ -34,156 +24,124 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
+const storage = getStorage(app);
 
 export default function App() {
   const { width, height } = useWindowDimensions(); 
   const [permission, requestPermission] = useCameraPermissions();
-  const [mediaPermission, requestMediaPermission] = MediaLibrary.usePermissions(); 
   
-  const [role, setRole] = useState<'setup' | 'host' | 'client'>('setup');
+  const [role, setRole] = useState<'setup' | 'host' | 'client' | 'download'>('setup');
   const [sessionId, setSessionId] = useState<string>('');
-  const [joinCode, setJoinCode] = useState<string>('');
+  const [inputCode, setInputCode] = useState<string>('');
   const [isReady, setIsReady] = useState(false);
   
-  // Firebase Sync States
+  // Cloud States
   const [clientConnected, setClientConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   
   const cameraRef = useRef<any>(null);
   const isRecordingRef = useRef(false);
 
-  // --- ECHTZEIT SYNCHRONISATION (Firebase) ---
+  // --- ECHTZEIT SYNCHRONISATION ---
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId || role === 'download') return;
 
-    try {
-      const docRef = doc(db, 'veo_sessions', sessionId);
-      const unsubscribe = onSnapshot(docRef, (docSnap) => {
-        if (docSnap.exists()) {
-          const data = docSnap.data();
-          setClientConnected(data.clientConnected);
+    const docRef = doc(db, 'veo_sessions', sessionId);
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setClientConnected(data.clientConnected);
 
-          if (data.recording && !isRecordingRef.current) {
-            startActualRecording();
-          } else if (!data.recording && isRecordingRef.current) {
-            stopActualRecording();
-          }
+        if (data.recording && !isRecordingRef.current) {
+          startActualRecording();
+        } else if (!data.recording && isRecordingRef.current) {
+          stopActualRecording();
         }
-      }, (error) => {
-        console.log("Firebase Listener wartet (Offline-Modus aktiv)");
-      });
+      }
+    });
+    return () => unsubscribe();
+  }, [sessionId, role]);
 
-      return () => unsubscribe();
-    } catch (e) {
-      console.log("Offline-Modus aktiv");
-    }
-  }, [sessionId]);
-
-  // 1. Berechtigungen prüfen
-  if (!permission || !mediaPermission) return <View style={styles.container} />;
-  
-  if (!permission.granted || !mediaPermission.granted) {
-    const requestAllPermissions = async () => {
-      await requestPermission();
-      await requestMediaPermission();
-    };
-
+  if (!permission) return <View style={styles.container} />;
+  if (!permission.granted) {
     return (
       <View style={styles.centeredContainer}>
-        <Text style={styles.title}>Zugriff erforderlich</Text>
-        <Text style={styles.subtitle}>Wir benötigen Zugriff auf die Kamera und Fotos-App.</Text>
-        <TouchableOpacity style={styles.primaryButton} onPress={requestAllPermissions}>
-          <Text style={styles.buttonText}>Zugriff erlauben</Text>
+        <Text style={styles.title}>Kamera-Zugriff</Text>
+        <TouchableOpacity style={styles.primaryButton} onPress={requestPermission}>
+          <Text style={styles.buttonText}>Erlauben</Text>
         </TouchableOpacity>
       </View>
     );
   }
 
-  // 2. Setup-Funktionen (SOFORTIGER UI-WECHSEL)
+  // --- SETUP FUNKTIONEN ---
   const createSession = async () => {
     const code = Math.floor(1000 + Math.random() * 9000).toString();
-    
-    // 1. UI SOFORT aktualisieren, um Hänger zu vermeiden!
     setSessionId(code);
     setRole('host');
     setIsReady(true); 
+    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE).catch(e => {});
 
-    // 2. Versuch, das Querformat zu aktivieren
-    try {
-      await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
-    } catch (e) {
-      console.warn("Querformat konnte nicht geladen werden.");
-    }
-
-    // 3. Versuch, Firebase im Hintergrund zu kontaktieren
     try {
       await setDoc(doc(db, 'veo_sessions', code), {
         hostConnected: true,
         clientConnected: false,
-        recording: false
+        recording: false,
+        camA_url: null,
+        camB_url: null,
+        stitched_url: null,
+        status: 'waiting'
       });
-    } catch (error) {
-      console.log("Firebase Fehler (Ignoriert für Testmodus)");
-    }
+    } catch (e) { console.log("Firebase Fehler"); }
   };
 
   const joinSession = async () => {
-    if (joinCode.length !== 4) {
-      Alert.alert('Ungültiger Code', 'Bitte gib einen 4-stelligen Code ein.');
-      return;
-    }
-    
-    // 1. UI SOFORT aktualisieren
-    setSessionId(joinCode);
+    if (inputCode.length !== 4) return Alert.alert('Fehler', 'PIN muss 4-stellig sein');
+    setSessionId(inputCode);
     setRole('client');
     setIsReady(true);
+    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE).catch(e => {});
 
     try {
-      await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
-    } catch (e) {}
+      await updateDoc(doc(db, 'veo_sessions', inputCode), { clientConnected: true });
+    } catch (e) { console.log("Firebase Fehler"); }
+  };
 
-    try {
-      await updateDoc(doc(db, 'veo_sessions', joinCode), {
-        clientConnected: true
-      });
-    } catch (error) {
-      console.log("Firebase Fehler (Ignoriert für Testmodus)");
-    }
+  const checkDownload = async () => {
+    if (inputCode.length !== 4) return Alert.alert('Fehler', 'PIN muss 4-stellig sein');
+    setRole('download');
+    
+    const docRef = doc(db, 'veo_sessions', inputCode);
+    onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists() && docSnap.data().stitched_url) {
+        setDownloadUrl(docSnap.data().stitched_url);
+      } else {
+        setDownloadUrl(null);
+      }
+    });
   };
 
   const leaveSession = async () => {
-    if (isRecordingRef.current) {
-      Alert.alert('Aufnahme läuft', 'Bitte stoppe die Aufnahme zuerst.');
-      return;
-    }
-    try {
-      await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
-    } catch (e) {}
-    
+    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(e => {});
     setIsReady(false);
     setRole('setup');
     setSessionId('');
-    setJoinCode('');
+    setInputCode('');
     setClientConnected(false);
+    setUploadProgress(null);
+    setDownloadUrl(null);
   };
 
-  // 3. Aufnahme-Steuerung
+  // --- AUFNAHME & CLOUD UPLOAD ---
   const toggleRecordingHost = async () => {
     if (role !== 'host' || !clientConnected) return;
-    
     const newState = !isRecordingRef.current;
-    
     try {
-      await updateDoc(doc(db, 'veo_sessions', sessionId), {
-        recording: newState
-      });
+      await updateDoc(doc(db, 'veo_sessions', sessionId), { recording: newState });
     } catch (error) {
-      // FALLBACK für den Testmodus ohne echtes Firebase
-      if (newState) {
-        startActualRecording();
-      } else {
-        stopActualRecording();
-      }
+      if (newState) startActualRecording(); else stopActualRecording();
     }
   };
 
@@ -193,13 +151,14 @@ export default function App() {
     setIsRecording(true);
     
     try {
-      const video = await cameraRef.current.recordAsync({ maxDuration: 300 });
+      // Nimmt auf, bis stopRecording() aufgerufen wird
+      const video = await cameraRef.current.recordAsync();
+      setIsRecording(false);
+      
       if (video && video.uri) {
-        await MediaLibrary.saveToLibraryAsync(video.uri);
-        Alert.alert('Gespeichert! 🎬', 'Video wurde in der Mediathek abgelegt.');
+        uploadVideoToCloud(video.uri);
       }
     } catch (error) {
-      console.error(error);
       isRecordingRef.current = false;
       setIsRecording(false);
     }
@@ -209,43 +168,80 @@ export default function App() {
     if (!cameraRef.current) return;
     cameraRef.current.stopRecording();
     isRecordingRef.current = false;
-    setIsRecording(false);
+  };
+
+  const uploadVideoToCloud = async (uri: string) => {
+    try {
+      setUploadProgress(0);
+      const response = await fetch(uri);
+      const blob = await response.blob();
+      
+      const fileName = `session_${sessionId}_cam${role === 'host' ? 'A' : 'B'}.mp4`;
+      const storageRef = ref(storage, `raw_uploads/${fileName}`);
+      
+      const uploadTask = uploadBytesResumable(storageRef, blob);
+      
+      uploadTask.on('state_changed', 
+        (snapshot) => {
+          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+          setUploadProgress(Math.round(progress));
+        }, 
+        (error) => {
+          Alert.alert("Upload Fehler", error.message);
+          setUploadProgress(null);
+        }, 
+        async () => {
+          const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
+          const updateData = role === 'host' ? { camA_url: downloadURL } : { camB_url: downloadURL };
+          
+          await updateDoc(doc(db, 'veo_sessions', sessionId), {
+            ...updateData,
+            status: 'raw_uploaded'
+          });
+          
+          Alert.alert("Upload Erfolgreich!", "Das Video ist nun in der Cloud. Dein PC kann das Stitching beginnen.");
+          setUploadProgress(100);
+        }
+      );
+    } catch (error) {
+      Alert.alert("Fehler", "Video konnte nicht verarbeitet werden.");
+    }
   };
 
   // --- RENDER: SETUP BILSCHIRM ---
-  if (!isReady) {
+  if (!isReady && role !== 'download') {
     return (
       <SafeAreaView style={styles.container}>
         <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
           <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
             <View style={styles.setupContent}>
-              <Text style={styles.title}>VeoClone Einrichtung</Text>
+              <Text style={styles.title}>VeoClone Cloud Setup</Text>
               
               <View style={styles.card}>
-                <Text style={styles.cardTitle}>Kamera A (Host)</Text>
+                <Text style={styles.cardTitle}>1. Neues Spiel aufzeichnen</Text>
                 <TouchableOpacity style={styles.primaryButton} onPress={createSession}>
-                  <Text style={styles.buttonText}>Session erstellen</Text>
+                  <Text style={styles.buttonText}>Kamera A (Host) starten</Text>
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>2. Zweite Kamera koppeln</Text>
+                <TextInput 
+                  style={styles.input} placeholder="PIN eingeben" placeholderTextColor="#666"
+                  keyboardType="number-pad" maxLength={4} value={inputCode}
+                  onChangeText={text => setInputCode(text)}
+                />
+                <TouchableOpacity style={styles.secondaryButton} onPress={joinSession}>
+                  <Text style={styles.buttonText}>Kamera B (Client) verbinden</Text>
                 </TouchableOpacity>
               </View>
 
               <View style={styles.divider} />
 
               <View style={styles.card}>
-                <Text style={styles.cardTitle}>Kamera B (Client)</Text>
-                <TextInput 
-                  style={styles.input}
-                  placeholder="PIN eingeben"
-                  placeholderTextColor="#666"
-                  keyboardType="number-pad"
-                  maxLength={4}
-                  value={joinCode}
-                  onChangeText={(text) => {
-                    setJoinCode(text);
-                    if (text.length === 4) Keyboard.dismiss();
-                  }}
-                />
-                <TouchableOpacity style={styles.secondaryButton} onPress={joinSession}>
-                  <Text style={styles.buttonText}>Beitreten</Text>
+                <Text style={styles.cardTitle}>3. Fertiges Spiel ansehen</Text>
+                <TouchableOpacity style={styles.downloadButton} onPress={checkDownload}>
+                  <Text style={styles.buttonText}>Nach fertigem Video suchen</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -255,52 +251,48 @@ export default function App() {
     );
   }
 
+  // --- RENDER: DOWNLOAD BILSCHIRM ---
+  if (role === 'download') {
+    return (
+      <SafeAreaView style={styles.centeredContainer}>
+        <Text style={styles.title}>Spiel {inputCode}</Text>
+        {downloadUrl ? (
+          <View style={styles.card}>
+            <Text style={{color: '#fff', marginBottom: 20, textAlign: 'center'}}>Dein fertig gestitchtes Panorama-Video ist bereit!</Text>
+            <TouchableOpacity style={styles.primaryButton} onPress={() => Alert.alert("Download", downloadUrl)}>
+              <Text style={styles.buttonText}>Video Öffnen / Speichern</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <Text style={{color: '#aaa', marginTop: 20}}>Der PC verarbeitet das Video noch... Bitte warten.</Text>
+        )}
+        <TouchableOpacity style={[styles.leaveButton, {marginTop: 40}]} onPress={leaveSession}>
+          <Text style={styles.leaveText}>Zurück</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
   // --- RENDER: KAMERA BILSCHIRM ---
   return (
     <View style={styles.container}>
       <CameraView style={StyleSheet.absoluteFillObject} facing="back" mode="video" ref={cameraRef} />
 
-      {/* DYNAMISCHES AUSRICHTUNGS-RASTER FÜR SEITENLINIEN-SETUP IM QUERFORMAT */}
-      <View style={styles.gridContainer} pointerEvents="none">
-        <View style={[styles.horizontalLine, { top: height * 0.4 }]} />
-        <Text style={[styles.horizonText, { top: (height * 0.4) - 25 }]}>Spielfeldrand / Horizont</Text>
-
-        {role === 'host' && (
-          <>
-            <View style={[styles.verticalLine, { left: '80%' }]} />
-            <Text style={[styles.verticalText, { left: '81%', width: 120, top: height * 0.15 }]}>Mittellinie hier (Überlappung)</Text>
-            <View style={[styles.overlapZone, { left: '80%', width: '20%' }]} />
-          </>
-        )}
-
-        {role === 'client' && (
-          <>
-            <View style={[styles.verticalLine, { left: '20%' }]} />
-            <Text style={[styles.verticalText, { right: '81%', width: 120, textAlign: 'right', top: height * 0.15 }]}>Mittellinie hier (Überlappung)</Text>
-            <View style={[styles.overlapZone, { left: '0%', width: '20%' }]} />
-          </>
-        )}
-      </View>
-
-      {/* Sperr-Overlay, wenn Geräte noch nicht verbunden sind */}
-      {!clientConnected && (
+      {/* Upload Overlay */}
+      {uploadProgress !== null && (
         <View style={styles.waitingOverlay}>
-          {/* SIMULATOR TRICK FÜR DEN TESTMODUS */}
-          <TouchableOpacity 
-            onPress={() => setClientConnected(true)} 
-            style={styles.simulateConnectButton}
-          >
-            <Text style={styles.waitingText}>
-              {role === 'host' ? 'Warte auf Kamera B...' : 'Verbinde mit Host...'}
-            </Text>
-            <Text style={styles.simulateText}>
-              (Tippe hier, um eine Verbindung für den Test zu simulieren)
-            </Text>
-          </TouchableOpacity>
+          <ActivityIndicator size="large" color="#34C759" />
+          <Text style={styles.waitingText}>Lade in die Cloud hoch...</Text>
+          <Text style={styles.waitingText}>{uploadProgress}%</Text>
         </View>
       )}
 
-      {/* UI Leiste Oben */}
+      {!clientConnected && uploadProgress === null && (
+        <View style={styles.waitingOverlay}>
+          <Text style={styles.waitingText}>{role === 'host' ? 'Warte auf Kamera B...' : 'Verbinde mit Host...'}</Text>
+        </View>
+      )}
+
       <View style={styles.topBarLandscape}>
         <TouchableOpacity style={styles.leaveButton} onPress={leaveSession}>
           <Text style={styles.leaveText}>X</Text>
@@ -315,7 +307,6 @@ export default function App() {
         </View>
       </View>
 
-      {/* REC Indikator */}
       {isRecording && (
         <View style={styles.recordingIndicatorLandscape}>
           <View style={styles.redDot} />
@@ -323,45 +314,33 @@ export default function App() {
         </View>
       )}
 
-      {/* Aufnahme Button - NUR SICHTBAR FÜR HOST */}
-      {role === 'host' && (
+      {role === 'host' && uploadProgress === null && (
         <View style={styles.rightBarLandscape}>
           <TouchableOpacity 
             style={[styles.recordOuter, !clientConnected && styles.recordDisabled]} 
-            onPress={toggleRecordingHost}
-            disabled={!clientConnected}
+            onPress={toggleRecordingHost} disabled={!clientConnected}
           >
             <View style={[styles.recordInner, isRecording && styles.recordInnerActive, !clientConnected && styles.recordDisabledInner]} />
           </TouchableOpacity>
-        </View>
-      )}
-
-      {/* Info-Text für den Client */}
-      {role === 'client' && clientConnected && (
-        <View style={styles.rightBarLandscape}>
-          <Text style={styles.clientWaitingText}>Warte auf Host-Signal...</Text>
         </View>
       )}
     </View>
   );
 }
 
-// --- STYLES ---
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#000' },
   centeredContainer: { flex: 1, backgroundColor: '#111', alignItems: 'center', justifyContent: 'center', padding: 20 },
   setupContent: { flex: 1, padding: 20, justifyContent: 'center' },
-  title: { fontSize: 28, fontWeight: 'bold', color: '#fff', marginBottom: 30, textAlign: 'center' },
-  subtitle: { fontSize: 16, color: '#aaa', textAlign: 'center', marginBottom: 20 },
-  card: { backgroundColor: '#1c1c1e', padding: 20, borderRadius: 16, marginBottom: 20 },
-  cardTitle: { fontSize: 18, fontWeight: 'bold', color: '#fff', marginBottom: 15 },
-  primaryButton: { backgroundColor: '#34C759', padding: 16, borderRadius: 12, alignItems: 'center' },
-  secondaryButton: { backgroundColor: '#007AFF', padding: 16, borderRadius: 12, alignItems: 'center' },
+  title: { fontSize: 24, fontWeight: 'bold', color: '#fff', marginBottom: 20, textAlign: 'center' },
+  card: { backgroundColor: '#1c1c1e', padding: 20, borderRadius: 16, marginBottom: 15 },
+  cardTitle: { fontSize: 16, fontWeight: 'bold', color: '#fff', marginBottom: 10 },
+  primaryButton: { backgroundColor: '#34C759', padding: 14, borderRadius: 10, alignItems: 'center' },
+  secondaryButton: { backgroundColor: '#007AFF', padding: 14, borderRadius: 10, alignItems: 'center' },
+  downloadButton: { backgroundColor: '#FF9500', padding: 14, borderRadius: 10, alignItems: 'center' },
   buttonText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
-  input: { backgroundColor: '#2c2c2e', color: '#fff', padding: 16, borderRadius: 12, fontSize: 18, textAlign: 'center', marginBottom: 16, letterSpacing: 4 },
+  input: { backgroundColor: '#2c2c2e', color: '#fff', padding: 14, borderRadius: 10, fontSize: 16, textAlign: 'center', marginBottom: 10, letterSpacing: 4 },
   divider: { height: 1, backgroundColor: '#333', marginVertical: 10 },
-  
-  // Kamera UI
   topBarLandscape: { position: 'absolute', top: 20, left: 40, right: 40, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', zIndex: 10 },
   leaveButton: { backgroundColor: 'rgba(0,0,0,0.6)', width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' },
   leaveText: { color: '#fff', fontWeight: 'bold', fontSize: 18 },
@@ -369,29 +348,15 @@ const styles = StyleSheet.create({
   statusText: { color: '#fff', fontWeight: 'bold' },
   codeBadge: { backgroundColor: 'rgba(255,255,255,0.2)', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, borderWidth: 1, borderColor: 'rgba(255,255,255,0.5)' },
   codeText: { color: '#fff', fontWeight: 'bold', fontFamily: 'Courier' },
-  
   rightBarLandscape: { position: 'absolute', right: 40, top: '50%', marginTop: -40, alignItems: 'center', zIndex: 10 },
   recordOuter: { width: 80, height: 80, borderRadius: 40, borderWidth: 4, borderColor: '#fff', justifyContent: 'center', alignItems: 'center' },
   recordInner: { width: 66, height: 66, borderRadius: 33, backgroundColor: '#FF3B30' },
   recordInnerActive: { width: 40, height: 40, borderRadius: 8 },
   recordDisabled: { borderColor: 'rgba(255,255,255,0.3)' },
   recordDisabledInner: { backgroundColor: 'rgba(255, 59, 48, 0.3)' },
-  
   recordingIndicatorLandscape: { position: 'absolute', top: 30, alignSelf: 'center', flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255, 59, 48, 0.8)', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 16, zIndex: 10 },
   redDot: { width: 8, height: 8, backgroundColor: '#fff', borderRadius: 4, marginRight: 6 },
   recordingText: { color: '#fff', fontWeight: 'bold' },
-
-  waitingOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', alignItems: 'center', zIndex: 5 },
-  simulateConnectButton: { alignItems: 'center', padding: 20 },
-  waitingText: { color: '#fff', fontSize: 24, fontWeight: 'bold', marginBottom: 10 },
-  simulateText: { color: '#888', fontSize: 14 },
-  clientWaitingText: { color: '#fff', backgroundColor: 'rgba(0,0,0,0.5)', padding: 10, borderRadius: 8, fontWeight: 'bold' },
-
-  // Raster Styles
-  gridContainer: { ...StyleSheet.absoluteFillObject },
-  horizontalLine: { position: 'absolute', height: 1, width: '100%', backgroundColor: 'rgba(52, 199, 89, 0.8)' },
-  horizonText: { position: 'absolute', left: 40, color: 'rgba(52, 199, 89, 0.9)', fontSize: 12, fontWeight: 'bold', letterSpacing: 1 },
-  verticalLine: { position: 'absolute', width: 2, height: '100%', backgroundColor: 'rgba(255, 204, 0, 0.8)', borderStyle: 'dashed' },
-  verticalText: { position: 'absolute', color: 'rgba(255, 204, 0, 0.9)', fontSize: 14, fontWeight: 'bold', backgroundColor: 'rgba(0,0,0,0.5)', padding: 4, borderRadius: 4 },
-  overlapZone: { position: 'absolute', height: '100%', backgroundColor: 'rgba(255, 204, 0, 0.15)' }
+  waitingOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center', zIndex: 20 },
+  waitingText: { color: '#fff', fontSize: 20, fontWeight: 'bold', marginTop: 15 },
 });
