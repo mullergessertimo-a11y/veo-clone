@@ -32,7 +32,11 @@ export default function App() {
   
   const [role, setRole] = useState<'setup' | 'host' | 'client' | 'download'>('setup');
   const [sessionId, setSessionId] = useState<string>('');
+  
+  // Getrennte Eingabefelder für Kopplung und Download
   const [inputCode, setInputCode] = useState<string>('');
+  const [downloadCode, setDownloadCode] = useState<string>('');
+  
   const [isReady, setIsReady] = useState(false);
   
   // Cloud States
@@ -110,10 +114,10 @@ export default function App() {
   };
 
   const checkDownload = async () => {
-    if (inputCode.length !== 4) return Alert.alert('Fehler', 'PIN muss 4-stellig sein');
+    if (downloadCode.length !== 4) return Alert.alert('Fehler', 'PIN muss 4-stellig sein');
     setRole('download');
     
-    const docRef = doc(db, 'veo_sessions', inputCode);
+    const docRef = doc(db, 'veo_sessions', downloadCode);
     onSnapshot(docRef, (docSnap) => {
       if (docSnap.exists() && docSnap.data().stitched_url) {
         setDownloadUrl(docSnap.data().stitched_url);
@@ -129,6 +133,7 @@ export default function App() {
     setRole('setup');
     setSessionId('');
     setInputCode('');
+    setDownloadCode('');
     setClientConnected(false);
     setUploadProgress(null);
     setDownloadUrl(null);
@@ -151,7 +156,6 @@ export default function App() {
     setIsRecording(true);
     
     try {
-      // Nimmt auf, bis stopRecording() aufgerufen wird
       const video = await cameraRef.current.recordAsync();
       setIsRecording(false);
       
@@ -240,8 +244,14 @@ export default function App() {
 
               <View style={styles.card}>
                 <Text style={styles.cardTitle}>3. Fertiges Spiel ansehen</Text>
+                {/* NEU: Eigenes Eingabefeld für den Download */}
+                <TextInput 
+                  style={styles.input} placeholder="PIN des Spiels eingeben" placeholderTextColor="#666"
+                  keyboardType="number-pad" maxLength={4} value={downloadCode}
+                  onChangeText={text => setDownloadCode(text)}
+                />
                 <TouchableOpacity style={styles.downloadButton} onPress={checkDownload}>
-                  <Text style={styles.buttonText}>Nach fertigem Video suchen</Text>
+                  <Text style={styles.buttonText}>Fertiges Video abrufen</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -255,7 +265,7 @@ export default function App() {
   if (role === 'download') {
     return (
       <SafeAreaView style={styles.centeredContainer}>
-        <Text style={styles.title}>Spiel {inputCode}</Text>
+        <Text style={styles.title}>Spiel {downloadCode}</Text>
         {downloadUrl ? (
           <View style={styles.card}>
             <Text style={{color: '#fff', marginBottom: 20, textAlign: 'center'}}>Dein fertig gestitchtes Panorama-Video ist bereit!</Text>
@@ -264,7 +274,7 @@ export default function App() {
             </TouchableOpacity>
           </View>
         ) : (
-          <Text style={{color: '#aaa', marginTop: 20}}>Der PC verarbeitet das Video noch... Bitte warten.</Text>
+          <Text style={{color: '#aaa', marginTop: 20}}>Der PC verarbeitet das Video noch oder die PIN ist falsch... Bitte warten.</Text>
         )}
         <TouchableOpacity style={[styles.leaveButton, {marginTop: 40}]} onPress={leaveSession}>
           <Text style={styles.leaveText}>Zurück</Text>
@@ -287,9 +297,18 @@ export default function App() {
         </View>
       )}
 
+      {/* Wartebildschirm mit "Abbrechen" Button */}
       {!clientConnected && uploadProgress === null && (
         <View style={styles.waitingOverlay}>
           <Text style={styles.waitingText}>{role === 'host' ? 'Warte auf Kamera B...' : 'Verbinde mit Host...'}</Text>
+          
+          {/* NEU: Deutlicher Abbrechen-Button damit man nicht gefangen ist */}
+          <TouchableOpacity 
+            style={styles.cancelButton} 
+            onPress={leaveSession}
+          >
+            <Text style={styles.cancelButtonText}>Abbrechen & Zurück</Text>
+          </TouchableOpacity>
         </View>
       )}
 
@@ -359,4 +378,6 @@ const styles = StyleSheet.create({
   recordingText: { color: '#fff', fontWeight: 'bold' },
   waitingOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center', zIndex: 20 },
   waitingText: { color: '#fff', fontSize: 20, fontWeight: 'bold', marginTop: 15 },
+  cancelButton: { marginTop: 30, backgroundColor: 'rgba(255,255,255,0.15)', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 25, borderWidth: 1, borderColor: 'rgba(255,255,255,0.3)' },
+  cancelButtonText: { color: '#fff', fontWeight: 'bold', fontSize: 16 }
 });
